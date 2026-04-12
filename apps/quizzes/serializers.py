@@ -1,19 +1,15 @@
 """
 Serializers pour l'app 'quizzes'.
 
-On distingue deux "vues" du quiz selon l'utilisateur :
-    - Vue FORMATEUR : voit is_correct des réponses (pour corriger/créer le quiz)
-    - Vue APPRENANT : ne voit PAS is_correct (pour éviter la triche)
-
-Serializers disponibles :
-    - AnswerSerializer          : réponse avec is_correct (formateur)
-    - AnswerStudentSerializer   : réponse SANS is_correct (apprenant)
-    - QuestionSerializer        : question avec réponses (formateur)
-    - QuestionStudentSerializer : question avec réponses masquées (apprenant)
-    - QuizSerializer            : quiz complet pour formateur
-    - QuizStudentSerializer     : quiz pour apprenant (is_correct caché)
-    - QuizSubmissionSerializer  : données soumises par l'apprenant
-    - QuizAttemptSerializer     : résultat d'une tentative
+  - QuizSerializer           : lecture quiz (formateur)
+  - QuizWriteSerializer      : écriture quiz
+  - QuizStudentSerializer    : lecture quiz (apprenant, sans is_correct)
+  - QuizSubmissionSerializer : validation des réponses soumises
+  - QuizAttemptSerializer    : résultat d'une tentative
+  - QuestionSerializer       : lecture question
+  - QuestionWriteSerializer  : écriture question
+  - AnswerSerializer         : lecture réponse
+  - AnswerWriteSerializer    : écriture réponse
 """
 
 from rest_framework import serializers
@@ -22,77 +18,52 @@ from .models import Answer, AttemptAnswer, Question, Quiz, QuizAttempt
 
 
 # ─────────────────────────────────────────────
-# RÉPONSES
+# ANSWER
 # ─────────────────────────────────────────────
 
 class AnswerSerializer(serializers.ModelSerializer):
-    """
-    Serializer de réponse COMPLET — réservé aux formateurs.
-    Inclut is_correct (la bonne réponse est visible).
-    """
+    """Lecture d'une réponse (avec is_correct visible)."""
 
     class Meta:
         model = Answer
-        fields = ('id', 'text', 'is_correct')
-
-
-class AnswerStudentSerializer(serializers.ModelSerializer):
-    """
-    Serializer de réponse pour les APPRENANTS.
-    is_correct est intentionnellement EXCLU pour éviter la triche.
-    """
-
-    class Meta:
-        model = Answer
-        fields = ('id', 'text')  # Pas de 'is_correct' !
+        fields = ['id', 'text', 'is_correct']
+        read_only_fields = ['id']
 
 
 class AnswerWriteSerializer(serializers.ModelSerializer):
-    """Serializer pour créer/modifier une réponse (formateur)."""
+    """Création/modification d'une réponse."""
 
     class Meta:
         model = Answer
-        fields = ('id', 'question', 'text', 'is_correct')
+        fields = ['id', 'text', 'is_correct']
 
 
 # ─────────────────────────────────────────────
-# QUESTIONS
+# QUESTION
 # ─────────────────────────────────────────────
 
 class QuestionSerializer(serializers.ModelSerializer):
-    """
-    Serializer de question COMPLET — réservé aux formateurs.
-    Inclut les réponses avec is_correct.
-    """
+    """Lecture d'une question avec ses réponses."""
 
-    # many=True : une liste de réponses imbriquées
     answers = AnswerSerializer(many=True, read_only=True)
 
     class Meta:
         model = Question
-        fields = ('id', 'text', 'question_type', 'order', 'points', 'answers')
-
-
-class QuestionStudentSerializer(serializers.ModelSerializer):
-    """
-    Serializer de question pour les APPRENANTS.
-    Les réponses ne montrent pas is_correct.
-    """
-
-    # AnswerStudentSerializer : version masquée (sans is_correct)
-    answers = AnswerStudentSerializer(many=True, read_only=True)
-
-    class Meta:
-        model = Question
-        fields = ('id', 'text', 'question_type', 'order', 'points', 'answers')
+        fields = ['id', 'text', 'question_type', 'order', 'points', 'answers']
+        read_only_fields = ['id']
 
 
 class QuestionWriteSerializer(serializers.ModelSerializer):
-    """Serializer pour créer/modifier une question (formateur)."""
+    """Création/modification d'une question."""
 
     class Meta:
         model = Question
-        fields = ('id', 'quiz', 'text', 'question_type', 'order', 'points')
+        fields = ['id', 'text', 'question_type', 'order', 'points']
+
+    def validate_points(self, value):
+        if value < 1:
+            raise serializers.ValidationError("Les points doivent être >= 1.")
+        return value
 
 
 # ─────────────────────────────────────────────
@@ -100,143 +71,117 @@ class QuestionWriteSerializer(serializers.ModelSerializer):
 # ─────────────────────────────────────────────
 
 class QuizSerializer(serializers.ModelSerializer):
-    """
-    Serializer de quiz COMPLET — réservé aux formateurs.
-    Inclut toutes les questions avec leurs réponses (is_correct visible).
-    """
+    """Lecture d'un quiz avec questions et réponses (formateur)."""
 
     questions = QuestionSerializer(many=True, read_only=True)
+    questions_count = serializers.SerializerMethodField()
 
     class Meta:
         model = Quiz
-        fields = ('id', 'module', 'titre', 'passing_score', 'questions')
+        fields = ['id', 'module', 'titre', 'passing_score', 'questions', 'questions_count']
+        read_only_fields = ['id']
 
-
-class QuizStudentSerializer(serializers.ModelSerializer):
-    """
-    Serializer de quiz pour les APPRENANTS.
-    Les bonnes réponses (is_correct) sont masquées.
-    """
-
-    # QuestionStudentSerializer : version masquée
-    questions = QuestionStudentSerializer(many=True, read_only=True)
-
-    class Meta:
-        model = Quiz
-        fields = ('id', 'titre', 'passing_score', 'questions')
-        # 'module' exclu : l'apprenant n'en a pas besoin ici
+    def get_questions_count(self, obj):
+        return obj.questions.count() if hasattr(obj, 'questions') else 0
 
 
 class QuizWriteSerializer(serializers.ModelSerializer):
-    """Serializer pour créer/modifier un quiz (formateur)."""
+    """Création/modification d'un quiz."""
 
     class Meta:
         model = Quiz
-        fields = ('id', 'module', 'titre', 'passing_score')
+        fields = ['id', 'titre', 'passing_score']
 
-    def validate_module(self, module):
-        """
-        Vérifie qu'un quiz n'existe pas déjà pour ce module.
-        Chaque module ne peut avoir qu'un seul quiz (OneToOneField).
-        On exclut l'instance actuelle pour permettre les modifications (PATCH).
-        """
-        queryset = Quiz.objects.filter(module=module)
-
-        # self.instance : l'objet existant lors d'une mise à jour (PATCH/PUT)
-        # On l'exclut pour ne pas bloquer la modification d'un quiz existant
-        if self.instance:
-            queryset = queryset.exclude(pk=self.instance.pk)
-
-        if queryset.exists():
-            raise serializers.ValidationError("Un quiz existe déjà pour ce module.")
-        return module
-
-
-# ─────────────────────────────────────────────
-# SOUMISSION DE QUIZ
-# ─────────────────────────────────────────────
-
-class AnswerSubmissionSerializer(serializers.Serializer):
-    """
-    Représente la réponse à UNE question dans une soumission.
-    Structure attendue : {"question_id": 1, "answer_id": 3}
-    """
-
-    question_id = serializers.IntegerField()
-    answer_id = serializers.IntegerField(required=False, allow_null=True)
-
-
-class QuizSubmissionSerializer(serializers.Serializer):
-    """
-    Données envoyées par l'apprenant lors de la soumission d'un quiz.
-
-    Structure JSON attendue :
-        {
-            "answers": [
-                {"question_id": 1, "answer_id": 3},
-                {"question_id": 2, "answer_id": 7},
-                ...
-            ]
-        }
-    """
-
-    # many=True : une liste de réponses (une par question)
-    answers = AnswerSubmissionSerializer(many=True)
-
-    def validate_answers(self, value):
-        """Vérifie qu'au moins une réponse est fournie."""
-        if not value:
-            raise serializers.ValidationError("Vous devez fournir au moins une réponse.")
+    def validate_passing_score(self, value):
+        if not (0 <= value <= 100):
+            raise serializers.ValidationError("Le score de validation doit être entre 0 et 100.")
         return value
 
 
+class QuizStudentSerializer(serializers.ModelSerializer):
+    """Quiz affiché à l'apprenant (sans is_correct dans les réponses)."""
+
+    questions = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Quiz
+        fields = ['id', 'module', 'titre', 'passing_score', 'questions']
+        read_only_fields = ['id']
+
+    def get_questions(self, obj):
+        """Retourne les questions avec réponses mais SANS is_correct."""
+        questions_data = []
+        for question in obj.questions.prefetch_related('answers').all():
+            answers_data = []
+            for answer in question.answers.all():
+                answers_data.append({
+                    'id': answer.id,
+                    'text': answer.text,
+                })
+            questions_data.append({
+                'id': question.id,
+                'text': question.text,
+                'question_type': question.question_type,
+                'order': question.order,
+                'points': question.points,
+                'answers': answers_data,
+            })
+        return questions_data
+
+
 # ─────────────────────────────────────────────
-# RÉSULTAT D'UNE TENTATIVE
+# ATTEMPT / SUBMISSION
 # ─────────────────────────────────────────────
+
+class QuizSubmissionAnswerSerializer(serializers.Serializer):
+    """Réponse individuelle soumise par l'apprenant."""
+
+    question_id = serializers.IntegerField(required=True)
+    answer_id = serializers.IntegerField(required=True)
+
+
+class QuizSubmissionSerializer(serializers.Serializer):
+    """Validation des réponses soumises par l'apprenant."""
+
+    answers = QuizSubmissionAnswerSerializer(many=True, required=True)
+
+    def validate(self, attrs):
+        if not attrs.get('answers'):
+            raise serializers.ValidationError("Au moins une réponse est requise.")
+        return attrs
+
 
 class AttemptAnswerSerializer(serializers.ModelSerializer):
-    """
-    Détail d'une réponse donnée lors d'une tentative.
-    Permet à l'apprenant de voir ses erreurs après correction.
-    """
+    """Réponse donnée lors d'une tentative."""
 
-    # SerializerMethodField : champ calculé dynamiquement
-    question_text = serializers.SerializerMethodField()
+    question_titre = serializers.SerializerMethodField()
     selected_answer_text = serializers.SerializerMethodField()
 
     class Meta:
         model = AttemptAnswer
-        fields = ('question_text', 'selected_answer_text', 'is_correct')
+        fields = ['id', 'question', 'question_titre', 'selected_answer', 'selected_answer_text', 'is_correct']
+        read_only_fields = ['id']
 
-    def get_question_text(self, obj):
-        """Retourne le texte de la question."""
-        return obj.question.text
+    def get_question_titre(self, obj):
+        return obj.question.text[:80] if obj.question else None
 
     def get_selected_answer_text(self, obj):
-        """Retourne le texte de la réponse choisie (ou None si pas de réponse)."""
-        if obj.selected_answer:
-            return obj.selected_answer.text
-        return None
+        return obj.selected_answer.text if obj.selected_answer else None
 
 
 class QuizAttemptSerializer(serializers.ModelSerializer):
-    """
-    Résultat complet d'une tentative de quiz.
-    Retourné après la soumission et disponible dans l'historique.
-    """
+    """Résultat d'une tentative de quiz."""
 
-    # Détail de chaque réponse donnée (avec correction)
     attempt_answers = AttemptAnswerSerializer(many=True, read_only=True)
-
-    # Nom du quiz pour l'affichage
     quiz_titre = serializers.SerializerMethodField()
 
     class Meta:
         model = QuizAttempt
-        fields = (
-            'id', 'quiz_titre', 'score', 'earned_points',
+        fields = [
+            'id', 'quiz', 'quiz_titre', 'score', 'earned_points',
             'total_points', 'passed', 'completed_at', 'attempt_answers',
-        )
+        ]
+        read_only_fields = ['id', 'completed_at']
 
     def get_quiz_titre(self, obj):
-        return obj.quiz.titre
+        return obj.quiz.titre if obj.quiz else None

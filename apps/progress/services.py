@@ -1,255 +1,189 @@
 """
-Services métier pour l'app 'progress'.
+Services pour l'app 'progress'.
 
-Ce fichier contient toute la logique de suivi de progression.
-Les views et signals appellent ce service — la logique est centralisée ici.
-
-ProgressService fournit :
-    - mark_lesson_complete()           : marquer une leçon comme terminée
-    - save_video_position()            : sauvegarder la position dans une vidéo
-    - update_last_accessed()           : mettre à jour la dernière leçon accédée
-    - get_or_create_lesson_progress()  : obtenir/créer un LessonProgress
-    - recalculate_formation_progress() : recalculer le pourcentage global
-
-Concept clé — get_or_create :
-    Django fournit .get_or_create(field=value) qui fait en une seule requête :
-        "Donne-moi l'objet avec ces critères, ou crée-le s'il n'existe pas."
-    Retourne (objet, created) où created=True si l'objet vient d'être créé.
-    Évite les conditions if/else et les race conditions.
+Contient la logique métier du suivi de progression.
 """
 
 from decimal import Decimal
 
-from django.db import transaction
-
-from apps.courses.models import Formation, Lesson, Module
+from django.utils import timezone
 
 from .models import FormationProgress, LessonProgress
 
 
 class ProgressService:
-    """Service centralisé pour toutes les opérations de suivi de progression."""
+    """Opérations métier sur la progression des apprenants."""
 
     @staticmethod
-    def get_or_create_lesson_progress(user, lesson) -> LessonProgress:
+    def mark_lesson_complete(user, lesson_id):
         """
-        Obtient ou crée un LessonProgress pour cet apprenant et cette leçon.
-
-        Appelé automatiquement à chaque accès à une leçon, ce qui permet de :
-            - Suivre quelle leçon l'apprenant visite (last_accessed_at)
-            - Initialiser l'enregistrement de progression au premier accès
+        Marque une leçon comme terminée et recalcule la progression.
 
         Args:
-            user:   L'apprenant
-            lesson: La leçon accédée
+            user: l'apprenant
+            lesson_id: ID de la leçon
 
         Returns:
-            Le LessonProgress existant ou nouvellement créé
+            LessonProgress: la progression de la leçon mise à jour
         """
-        # get_or_create : tente d'abord un SELECT, puis un INSERT si absent
-        # Le deuxième élément (created) n'est pas utilisé ici mais disponible
-        progress, _ = LessonProgress.objects.get_or_create(
+        from apps.courses.models import Lesson
+
+        try:
+            lesson = Lesson.objects.select_related('module__formation').get(pk=lesson_id)
+        except Lesson.DoesNotExist:
+            raise ValueError("Leçon introuvable.")
+
+        # Obtenir ou créer la progression de la leçon
+        lesson_progress, created = LessonProgress.objects.get_or_create(
             user=user,
             lesson=lesson,
         )
-        return progress
+        lesson_progress.completed = True
+        lesson_progress.save()
 
-    @staticmethod
-    @transaction.atomic
-    def mark_lesson_complete(user, lesson_id: int) -> LessonProgress:
-        """
-        Marque une leçon comme terminée et recalcule la progression globale.
+        # Mettre à jour la dernière leçon accédée
+        ProgressService.update_last_accessed(user, lesson_id)
 
-        @transaction.atomic : si le recalcul échoue, le marquage est aussi annulé.
-        On garantit ainsi que LessonProgress et FormationProgress restent cohérents.
-
-        Args:
-            user:      L'apprenant qui termine la leçon
-            lesson_id: L'ID de la leçon à marquer
-
-        Returns:
-            Le LessonProgress mis à jour
-
-        Raises:
-            Lesson.DoesNotExist: Si la leçon n'existe pas
-        """
-        # select_related : charge le module et la formation en une seule requête SQL
-        # au lieu de 3 requêtes séparées (Lesson → Module → Formation)
-        lesson = Lesson.objects.select_related('module__formation').get(pk=lesson_id)
-
-        # Obtenir ou créer le suivi de cette leçon
-        lesson_progress, _ = LessonProgress.objects.get_or_create(
-            user=user,
-            lesson=lesson,
-        )
-
-        # Marquer comme terminée seulement si pas déjà fait (évite le recalcul inutile)
-        if not lesson_progress.completed:
-            lesson_progress.completed = True
-            lesson_progress.save()
-
-            # Recalculer la progression globale de la formation
-            ProgressService.recalculate_formation_progress(user, lesson.module.formation)
+        # Recalculer la progression globale de la formation
+        ProgressService.recalculate_formation_progress(user, lesson.module.formation)
 
         return lesson_progress
 
     @staticmethod
-    def save_video_position(user, lesson_id: int, position_seconds: int) -> LessonProgress:
+    def save_video_position(user, lesson_id, position_seconds):
         """
-        Sauvegarde la position actuelle dans une vidéo.
-
-        Appelé régulièrement (ex: toutes les 30 secondes) pendant la lecture vidéo.
-        Permet à l'apprenant de reprendre la vidéo là où il s'est arrêté.
+        Sauvegarde la position dans une vidéo.
 
         Args:
-            user:             L'apprenant
-            lesson_id:        L'ID de la leçon vidéo
-            position_seconds: Position actuelle en secondes (ex: 245 = 4min05sec)
+            user: l'apprenant
+            lesson_id: ID de la leçon
+            position_seconds: position en secondes
 
         Returns:
-            Le LessonProgress mis à jour avec la nouvelle position
+            LessonProgress: la progression mise à jour
         """
-        lesson = Lesson.objects.get(pk=lesson_id)
+        from apps.courses.models import Lesson
 
-        # update_fields=['video_position_seconds'] : met à jour SEULEMENT ce champ
-        # Plus efficace que de sauvegarder tout l'objet (une seule colonne en SQL)
-        lesson_progress, _ = LessonProgress.objects.get_or_create(
+        try:
+            lesson = Lesson.objects.select_related('module__formation').get(pk=lesson_id)
+        except Lesson.DoesNotExist:
+            raise ValueError("Leçon introuvable.")
+
+        lesson_progress, created = LessonProgress.objects.get_or_create(
             user=user,
             lesson=lesson,
         )
         lesson_progress.video_position_seconds = position_seconds
-        lesson_progress.save(update_fields=['video_position_seconds'])
+        lesson_progress.last_accessed_at = timezone.now()
+        lesson_progress.save()
+
+        # Mettre à jour la dernière leçon accédée
+        ProgressService.update_last_accessed(user, lesson_id)
 
         return lesson_progress
 
     @staticmethod
-    def update_last_accessed(user, lesson_id: int) -> FormationProgress:
+    def get_or_create_lesson_progress(user, lesson):
         """
-        Met à jour la dernière leçon accédée par l'apprenant.
-
-        Utilisé pour la fonctionnalité "Reprendre où j'en étais" :
-        quand un apprenant revient sur une formation, on lui propose de
-        repartir directement de la dernière leçon consultée.
+        Retourne ou crée la progression d'une leçon et marque l'accès.
 
         Args:
-            user:      L'apprenant
-            lesson_id: La leçon actuellement consultée
+            user: l'apprenant
+            lesson: instance de Lesson
 
         Returns:
-            Le FormationProgress mis à jour
+            LessonProgress
         """
+        lesson_progress, created = LessonProgress.objects.get_or_create(
+            user=user,
+            lesson=lesson,
+        )
+        if not created:
+            lesson_progress.last_accessed_at = timezone.now()
+            lesson_progress.save()
+        return lesson_progress
+
+    @staticmethod
+    def update_last_accessed(user, lesson_id):
+        """
+        Met à jour la dernière leçon accédée dans la progression de la formation.
+
+        Args:
+            user: l'apprenant
+            lesson_id: ID de la leçon
+        """
+        from apps.courses.models import Lesson
+
         lesson = Lesson.objects.select_related('module__formation').get(pk=lesson_id)
         formation = lesson.module.formation
 
-        # Obtenir ou créer la progression globale pour cette formation
-        formation_progress, _ = FormationProgress.objects.get_or_create(
+        progress, _ = FormationProgress.objects.get_or_create(
             user=user,
             formation=formation,
         )
-
-        # Mettre à jour la dernière leçon accédée
-        # update_fields : ne touche que ces deux colonnes (plus efficace)
-        formation_progress.last_accessed_lesson = lesson
-        formation_progress.save(update_fields=['last_accessed_lesson', 'last_accessed_at'])
-
-        return formation_progress
+        progress.last_accessed_lesson = lesson
+        progress.last_accessed_at = timezone.now()
+        progress.save()
 
     @staticmethod
-    def recalculate_formation_progress(user, formation) -> FormationProgress:
+    def recalculate_formation_progress(user, formation):
         """
-        Recalcule et sauvegarde le pourcentage de progression d'un apprenant.
-
-        Appelé après chaque leçon terminée ou quiz validé.
+        Recalcule la progression globale d'un apprenant dans une formation.
 
         Formule :
-            percentage = (leçons_terminées + quiz_validés) / (total_leçons + total_quiz) × 100
-
-        Cas particuliers :
-            - Si total_leçons + total_quiz = 0 : percentage = 0 (évite la division par zéro)
-            - is_completed = True seulement si 100% ET il y a du contenu
+            percentage = (completed_lessons + passed_quizzes) / (total_lessons + total_quizzes) × 100
 
         Args:
-            user:      L'apprenant
-            formation: La Formation à recalculer
-
-        Returns:
-            Le FormationProgress mis à jour
+            user: l'apprenant
+            formation: la formation
         """
-        # ── Compter les leçons ────────────────────────────────────────────────
+        from apps.courses.models import Lesson
 
-        # Total de leçons dans toute la formation
-        # (on passe par Module car Formation → Module → Lesson)
-        total_lessons = Lesson.objects.filter(
-            module__formation=formation
-        ).count()
+        # Compter les leçons totales
+        total_lessons = Lesson.objects.filter(module__formation=formation).count()
 
-        # Leçons que cet apprenant a terminées (completed=True dans LessonProgress)
+        # Compter les leçons terminées
         completed_lessons = LessonProgress.objects.filter(
             user=user,
             lesson__module__formation=formation,
             completed=True,
         ).count()
 
-        # ── Compter les quiz ──────────────────────────────────────────────────
+        # Compter les quiz totaux et validés (via QuizAttempt)
+        total_quizzes = 0
+        passed_quizzes = 0
 
-        # Pour compter les quiz, on importe ici pour éviter les imports circulaires
-        # (progress → quizzes → progress créerait une boucle d'import Python)
-        try:
-            from apps.quizzes.models import Quiz, QuizAttempt
+        for module in formation.modules.all():
+            if hasattr(module, 'quiz'):
+                total_quizzes += 1
+                # Vérifier si l'apprenant a validé ce quiz
+                latest_attempt = module.quiz.attempts.filter(
+                    user=user,
+                    passed=True,
+                ).first()
+                if latest_attempt:
+                    passed_quizzes += 1
 
-            # Total de quiz dans la formation (un quiz par module au maximum)
-            total_quizzes = Quiz.objects.filter(
-                module__formation=formation
-            ).count()
-
-            # Quiz que l'apprenant a VALIDÉS (passed=True dans QuizAttempt)
-            # .values('quiz') : dédoublonne par quiz (l'apprenant peut avoir plusieurs tentatives)
-            # .distinct()     : s'assure de ne compter chaque quiz qu'une seule fois
-            passed_quizzes = QuizAttempt.objects.filter(
-                user=user,
-                quiz__module__formation=formation,
-                passed=True,
-            ).values('quiz').distinct().count()
-
-        except ImportError:
-            # Si l'app quizzes n'est pas encore installée (ex: tests isolés)
-            total_quizzes = 0
-            passed_quizzes = 0
-
-        # ── Calculer le pourcentage ────────────────────────────────────────────
-
-        # Dénominateur = total leçons + total quiz
-        total = total_lessons + total_quizzes
-
-        if total > 0:
-            # Calcul avec Decimal pour éviter les erreurs d'arrondi des floats
-            # Exemple : 7/13 en float = 0.5384615... mais en Decimal = 53.85
-            numerator = Decimal(completed_lessons + passed_quizzes)
-            percentage = (numerator / Decimal(total) * Decimal(100)).quantize(
-                Decimal('0.01')  # Arrondir à 2 décimales (ex: 66.67)
-            )
-        else:
-            # Formation sans contenu (aucune leçon, aucun quiz)
+        # Calculer le pourcentage
+        total_items = total_lessons + total_quizzes
+        if total_items == 0:
             percentage = Decimal('0.00')
+        else:
+            percentage = Decimal(str((completed_lessons + passed_quizzes) / total_items * 100)).quantize(
+                Decimal('0.01')
+            )
 
-        # Une formation est "terminée" seulement si :
-        #   1. Il y a du contenu (total > 0)
-        #   2. L'apprenant a tout fait (100%)
-        is_completed = (total > 0) and (percentage >= Decimal('100.00'))
-
-        # ── Sauvegarder le résultat ────────────────────────────────────────────
-        formation_progress, _ = FormationProgress.objects.get_or_create(
+        # Mettre à jour la progression
+        progress, _ = FormationProgress.objects.get_or_create(
             user=user,
             formation=formation,
         )
+        progress.completed_lessons = completed_lessons
+        progress.total_lessons = total_lessons
+        progress.passed_quizzes = passed_quizzes
+        progress.total_quizzes = total_quizzes
+        progress.percentage = percentage
+        progress.is_completed = (percentage >= Decimal('100.00'))
+        progress.save()
 
-        # Mettre à jour tous les champs dénormalisés d'un coup
-        formation_progress.completed_lessons = completed_lessons
-        formation_progress.total_lessons     = total_lessons
-        formation_progress.passed_quizzes    = passed_quizzes
-        formation_progress.total_quizzes     = total_quizzes
-        formation_progress.percentage        = percentage
-        formation_progress.is_completed      = is_completed
-        formation_progress.save()
-
-        return formation_progress
+        return progress
