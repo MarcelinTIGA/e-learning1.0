@@ -7,6 +7,7 @@ from .models import User, UserProfile
 class UserProfileInline(admin.StackedInline):
     model = UserProfile
     can_delete = False
+    extra = 0
 
 
 @admin.register(User)
@@ -28,3 +29,11 @@ class UserAdmin(BaseUserAdmin):
             'fields': ('email', 'first_name', 'last_name', 'role', 'password1', 'password2'),
         }),
     )
+
+    def get_inline_instances(self, request, obj=None):
+        # Sur la création (obj=None) : pas d'inline profil,
+        # le signal post_save le crée automatiquement.
+        # Sur l'édition : l'inline apparaît pour modifier phone/bio/avatar.
+        if obj is None:
+            return []
+        return super().get_inline_instances(request, obj)

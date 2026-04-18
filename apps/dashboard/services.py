@@ -90,11 +90,16 @@ class DashboardService:
                 'accessed_at': progress.last_accessed_at,
             })
 
+        # Quiz réussis
+        from apps.quizzes.models import QuizAttempt
+        quiz_passes = QuizAttempt.objects.filter(user=user, passed=True).count()
+
         return {
             'total_enrollments': total,
-            'active_enrollments': active,
-            'completed_enrollments': completed,
-            'certificates_count': certificates_count,
+            'formations_en_cours': active,
+            'formations_terminees': completed,
+            'certificats_obtenus': certificates_count,
+            'quiz_passes': quiz_passes,
             'current_progress': current_progress,
             'recent_activity': recent_activity,
         }
@@ -142,12 +147,22 @@ class DashboardService:
 
             total_revenue += Decimal(str(revenue))
 
+            # Taux de complétion par formation
+            completed_count = formation.enrollments.filter(
+                status=Enrollment.Status.COMPLETED
+            ).count()
+            total_enrolled = formation.enrollments.filter(
+                status__in=[Enrollment.Status.ACTIVE, Enrollment.Status.COMPLETED]
+            ).count()
+            taux_completion = (completed_count / total_enrolled * 100) if total_enrolled > 0 else 0
+
             formations_stats.append({
-                'formation_id': formation.pk,
+                'id': formation.pk,
                 'titre': formation.titre,
                 'is_published': formation.is_published,
-                'students_count': enrollments_count,
-                'revenue': float(revenue),
+                'nb_apprenants': enrollments_count,
+                'revenus': float(revenue),
+                'taux_completion': round(taux_completion, 1),
             })
 
         # Dernières inscriptions
@@ -163,12 +178,24 @@ class DashboardService:
                 'enrolled_at': enrollment.enrolled_at,
             })
 
+        # Taux de complétion global
+        total_active_completed = Enrollment.objects.filter(
+            formation__formateur=user,
+            status__in=[Enrollment.Status.ACTIVE, Enrollment.Status.COMPLETED],
+        ).count()
+        total_completed = Enrollment.objects.filter(
+            formation__formateur=user,
+            status=Enrollment.Status.COMPLETED,
+        ).count()
+        taux_completion = (total_completed / total_active_completed * 100) if total_active_completed > 0 else 0
+
         return {
             'total_formations': total_formations,
             'published_formations': published_formations,
-            'total_students': len(total_students_set),
-            'total_revenue': total_revenue,
-            'formations_stats': formations_stats,
+            'total_apprenants': len(total_students_set),
+            'total_revenus': total_revenue,
+            'taux_completion': round(taux_completion, 1),
+            'formations': formations_stats,
             'recent_enrollments': recent_enrollments,
         }
 
@@ -233,8 +260,10 @@ class DashboardService:
         ).order_by('-enrolled_at')[:5]:
             recent_activity.append({
                 'type': 'inscription',
+                'apprenant': enrollment.user.full_name,
                 'user': enrollment.user.full_name,
                 'formation': enrollment.formation.titre,
+                'montant': float(enrollment.formation.prix) if not enrollment.formation.is_free else 0,
                 'date': enrollment.enrolled_at,
             })
 
@@ -260,8 +289,8 @@ class DashboardService:
             'total_formations': total_formations,
             'published_formations': published_formations,
             'total_enrollments': total_enrollments,
-            'total_revenue': total_revenue,
+            'total_revenus': total_revenue,
             'certificates_issued': certificates_issued,
             'recent_users': recent_users,
-            'recent_activity': recent_activity[:10],  # Top 10
+            'recent_enrollments': recent_activity[:10],
         }

@@ -4,54 +4,114 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-A Django-based e-learning platform backend API. The project is currently in the initial scaffolding phase — all domain apps exist but models, views, and business logic are yet to be implemented.
+A Django REST Framework backend for an e-learning platform (type Udemy, with academic logic). All 8 backend phases are implemented. The next step is a Flutter frontend that consumes this API.
 
 ## Environment Setup
 
 ```bash
-source env/bin/activate   # activate the Python 3.13.7 virtual environment
+source env/bin/activate   # Python 3.13.7 virtual environment
 ```
 
-Dependencies (Django 6.0.4, asgiref, sqlparse) are installed in the `env/` directory. There is no `requirements.txt` yet.
+All dependencies are in `requirements.txt` and installed in `env/`. Key packages: Django 6.0.4, djangorestframework 3.17.1, djangorestframework-simplejwt 5.5.1, reportlab 4.4.0, django-allauth 65.15.1, django-filter 25.1, python-decouple 3.8.
 
 ## Common Commands
 
 ```bash
-python manage.py runserver          # start development server
-python manage.py makemigrations     # generate migration files after model changes
-python manage.py migrate            # apply migrations to db.sqlite3
-python manage.py createsuperuser    # create an admin user
-python manage.py shell              # interactive Django shell
-python manage.py test               # run all tests
-python manage.py test apps.courses  # run tests for a single app
-python manage.py check              # validate project configuration
+python manage.py runserver                        # start dev server
+python manage.py makemigrations <app>             # after model changes
+python manage.py migrate
+python manage.py test                             # all tests (~150+)
+python manage.py test apps.courses                # single app
+python manage.py test apps.courses.tests.CatalogueTest.test_filter_by_niveau  # single test
+python manage.py check                            # validate config
+python manage.py createsuperuser
 ```
+
+Settings use `python-decouple`: put `SECRET_KEY`, `DEBUG`, `ALLOWED_HOSTS` in a `.env` file at the project root.
 
 ## Architecture
 
-The project uses a modular Django app structure under `apps/`. Each app owns a domain:
+### Data Model Hierarchy
 
-| App | Responsibility |
+```
+User (UUID pk, email-based auth)
+  └── UserProfile (1:1, auto-created via signal)
+
+Category → Formation (formateur FK, prix, niveau, is_published)
+                └── Module (order, unique_together formation+order)
+                        ├── Lesson (content_type: video/pdf/text, is_preview, order)
+                        └── Quiz (1:1, passing_score)
+                                └── Question → Answer (is_correct hidden from students)
+
+Enrollment (user+formation, status: pending/active/completed/cancelled)
+  └── Payment (1:1, provider: orange_money/mtn_momo, Mobile Money stubs)
+
+LessonProgress (user+lesson, completed, video_position_seconds)
+FormationProgress (denormalized: completed_lessons, total_lessons, passed_quizzes, percentage, is_completed)
+
+Certificate (UUID pk, verification_code, pdf_file, formation_titre_snapshot)
+```
+
+### Cross-App Event Flow (Signals)
+
+- `post_save(User)` → auto-creates `UserProfile` (users/signals.py)
+- `post_save(QuizAttempt)` → recalculates `FormationProgress` (progress/signals.py)
+- `post_save(FormationProgress)` where `is_completed=True` → auto-generates `Certificate` PDF (certificates/signals.py)
+
+Signals are connected in each app's `AppConfig.ready()`.
+
+### Service Layer Pattern
+
+Business logic lives in `services.py`, not in views. Views only validate input and delegate:
+
+| Service | Key Methods |
 |---|---|
-| `authentication` | Login, registration, session management |
-| `users` | User profiles and preferences |
-| `courses` | Course content, structure, metadata |
-| `enrollments` | Student-course relationships |
-| `progress` | Module completion tracking |
-| `quizzes` | Questions, answers, grading |
-| `certificates` | Certificate issuance on completion |
-| `dashboard` | Analytics and reporting views |
+| `quizzes/services.py` — `QuizGradingService` | `grade_submission()` — `@transaction.atomic`, `bulk_create` for AttemptAnswers, `Decimal` arithmetic |
+| `enrollments/services.py` — `EnrollmentService` | `enroll()`, `confirm_payment()`, `cancel_enrollment()` |
+| `progress/services.py` — `ProgressService` | `mark_lesson_complete()`, `save_video_position()`, `recalculate_formation_progress()` |
+| `certificates/services.py` — `CertificateService` | `issue_certificate()`, PDF generation via reportlab |
+| `dashboard/services.py` — `DashboardService` | `get_student_dashboard()`, `get_formateur_dashboard()`, `get_admin_dashboard()` |
 
-URL routing starts at [elearning_backend/urls.py](elearning_backend/urls.py). Each app should register its own `urls.py` and include it there. The Django admin is available at `/admin/`.
+### User Roles & Permissions
 
-Core settings are in [elearning_backend/settings.py](elearning_backend/settings.py). The database is SQLite at `db.sqlite3` (root directory). `DEBUG=True` and `SECRET_KEY` are currently hardcoded — use environment variables before any deployment.
+`User.role` ∈ {`apprenant`, `formateur`, `administrateur`}. `is_also_admin=True` lets a formateur also be admin. Key properties: `is_apprenant`, `is_formateur`, `is_administrateur`.
 
-## Development Workflow
+Custom permissions in `apps/users/permissions.py`: `IsFormateurOrAdmin`, `IsOwnerOrAdmin`.
+Cross-app permission in `apps/enrollments/permissions.py`: `IsEnrolledAndPaid` — checks Enrollment status is active/completed for a given formation (traverses Lesson→Module→Formation hierarchy).
 
-1. Define models in `apps/<app>/models.py`
-2. Register models in `apps/<app>/admin.py`
-3. Run `makemigrations` + `migrate`
-4. Implement views and wire up URL patterns
-5. Write tests in `apps/<app>/tests.py`
+### Serializer Dual-View Pattern (quizzes)
 
-No REST framework is installed yet — add `djangorestframework` if building a JSON API.
+Two serializer sets for the same data: formateur sees `is_correct` on answers; apprenant uses `QuizStudentSerializer` / `AnswerStudentSerializer` which exclude it.
+
+### API Conventions
+
+- All responses paginated: `{"count": N, "next": "...", "previous": "...", "results": [...]}`
+- JWT Bearer tokens — 30min access, 7-day refresh with rotation and blacklist
+- `get_serializer_class()` override returns different serializers for GET vs POST/PATCH
+- `perform_create()` override injects FK from URL kwargs (e.g., `formateur=request.user`, `module=module`)
+- `select_related` / `prefetch_related` used throughout to avoid N+1 queries
+
+### Key URL Prefixes
+
+```
+/api/auth/          — register, login, logout, token/refresh, password/*
+/api/users/         — me/, profile/
+/api/courses/       — catalogue, formations CRUD, modules, lessons, categories
+/api/quizzes/       — quiz CRUD, submit, history, attempt
+/api/enrollments/   — enroll, confirm, cancel, webhook/
+/api/progress/      — formations/<id>/, lessons/<id>/complete|video
+/api/certificates/  — list, download, verify/<code>/
+/api/dashboard/     — student/, formateur/, admin/
+```
+
+### Payment Integration
+
+`enrollments/services.py` contains `OrangeMoneyGateway` and `MTNMoMoGateway` as stubs (always return success). Replace `initiate_payment()` and `verify_payment()` with real API calls when credentials are available. Webhook endpoint at `POST /api/enrollments/webhook/` is public (AllowAny) — add signature verification before production.
+
+### PDF Certificates
+
+`CertificateService.generate_pdf()` uses reportlab to produce a landscape A4 PDF stored in `media/certificates/pdfs/`. The `Certificate` model stores a `formation_titre_snapshot` at creation time so the document remains accurate if the formation is later renamed.
+
+### Circular Import Prevention
+
+`progress/services.py` and `quizzes/services.py` import from each other's apps inside function bodies (not at module level) to prevent circular import errors.

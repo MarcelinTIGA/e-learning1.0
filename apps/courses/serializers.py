@@ -116,54 +116,97 @@ class ModuleWriteSerializer(serializers.ModelSerializer):
 class FormationListSerializer(serializers.ModelSerializer):
     """Affichage léger dans les listes (catalogue, gestion)."""
 
-    formateur_nom = serializers.SerializerMethodField()
-    categorie_nom = serializers.SerializerMethodField()
-    modules_count = serializers.SerializerMethodField()
+    formateur_name = serializers.SerializerMethodField()
+    category_name  = serializers.SerializerMethodField()
+    modules_count  = serializers.SerializerMethodField()
+    lessons_count  = serializers.SerializerMethodField()
+    total_duration_minutes = serializers.SerializerMethodField()
 
     class Meta:
         model = Formation
         fields = [
             'id', 'titre', 'description', 'image', 'prix',
-            'niveau', 'is_published', 'formateur_nom',
-            'categorie_nom', 'modules_count', 'created_at',
-            'is_free',
+            'niveau', 'is_published', 'formateur_name',
+            'category_name', 'modules_count', 'lessons_count',
+            'total_duration_minutes', 'created_at', 'is_free',
         ]
         read_only_fields = ['id', 'is_free', 'created_at']
 
-    def get_formateur_nom(self, obj):
+    def get_formateur_name(self, obj):
         return obj.formateur.full_name if obj.formateur else None
 
-    def get_categorie_nom(self, obj):
+    def get_category_name(self, obj):
         return obj.categorie.name if obj.categorie else None
 
     def get_modules_count(self, obj):
         return obj.modules.count() if hasattr(obj, 'modules') else 0
 
+    def get_lessons_count(self, obj):
+        from django.db.models import Count
+        result = obj.modules.aggregate(total=Count('lessons'))
+        return result['total'] or 0
+
+    def get_total_duration_minutes(self, obj):
+        from django.db.models import Sum
+        result = Lesson.objects.filter(module__formation=obj).aggregate(
+            total=Sum('duration_minutes')
+        )
+        return result['total'] or 0
+
 
 class FormationDetailSerializer(serializers.ModelSerializer):
     """Détail complet d'une formation avec modules et leçons."""
 
-    formateur = serializers.SerializerMethodField()
-    categorie = CategorySerializer(read_only=True)
-    modules = ModuleSerializer(many=True, read_only=True)
+    formateur_name = serializers.SerializerMethodField()
+    category_name  = serializers.SerializerMethodField()
+    formateur      = serializers.SerializerMethodField()
+    categorie      = CategorySerializer(read_only=True)
+    modules        = ModuleSerializer(many=True, read_only=True)
+    modules_count  = serializers.SerializerMethodField()
+    lessons_count  = serializers.SerializerMethodField()
+    total_duration_minutes = serializers.SerializerMethodField()
 
     class Meta:
         model = Formation
         fields = [
             'id', 'titre', 'description', 'image', 'prix',
-            'niveau', 'is_published', 'formateur', 'categorie',
-            'modules', 'created_at', 'updated_at', 'is_free',
+            'niveau', 'is_published',
+            'formateur_name', 'category_name',
+            'formateur', 'categorie', 'modules',
+            'modules_count', 'lessons_count', 'total_duration_minutes',
+            'created_at', 'updated_at', 'is_free',
         ]
         read_only_fields = ['id', 'is_free', 'created_at', 'updated_at']
+
+    def get_formateur_name(self, obj):
+        return obj.formateur.full_name if obj.formateur else None
+
+    def get_category_name(self, obj):
+        return obj.categorie.name if obj.categorie else None
 
     def get_formateur(self, obj):
         if not obj.formateur:
             return None
         return {
-            'id': obj.formateur.id,
+            'id': str(obj.formateur.id),
             'email': obj.formateur.email,
             'full_name': obj.formateur.full_name,
         }
+
+    def get_modules_count(self, obj):
+        return obj.modules.count() if hasattr(obj, 'modules') else 0
+
+    def get_lessons_count(self, obj):
+        from django.db.models import Count
+        result = obj.modules.aggregate(total=Count('lessons'))
+        return result['total'] or 0
+
+    def get_total_duration_minutes(self, obj):
+        from django.db.models import Sum
+        result = Lesson.objects.filter(module__formation=obj).aggregate(
+            total=Sum('duration_minutes')
+        )
+        return result['total'] or 0
 
 
 class FormationWriteSerializer(serializers.ModelSerializer):
